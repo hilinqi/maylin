@@ -5,6 +5,9 @@ __pycache__/
 *.pyc
 *.pyo
 
+# 数据文件
+**/data/*.db
+
 # 系统文件
 .DS_Store
 Thumbs.db

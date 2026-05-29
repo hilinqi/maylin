@@ -585,9 +585,6 @@ class MainWindow:
                 "逾期半年": "orange", "逾期1年": "red", "久悬户": "darkred",
             }
             tag = color_map.get(c["overdue_level"], "green")
-            status_text = c["overdue_level"]
-            if c["overdue_months"] > 0:
-                status_text += f" ({c['overdue_months']}个月)"
 
             arrears = c.get("arrears_amount", 0)
 
@@ -603,9 +600,10 @@ class MainWindow:
                 status_text = "正常"
             else:
                 arrears_text = "正常" if arrears == 0 else f"¥{arrears:,.0f}"
-                status_text = c["overdue_level"]
                 if c["overdue_months"] > 0:
-                    status_text += f" ({c['overdue_months']}个月)"
+                    status_text = f"逾期{c['overdue_months']}个月"
+                else:
+                    status_text = "正常"
 
             # 行颜色：中断=蓝、失联=红、已收=绿、未收=逾期等级色
             client_status = c.get("status", "有效")
@@ -933,14 +931,16 @@ class MainWindow:
                 charge_period_end=period_end,
             )
             if ok:
-                Toast.show(self.window, msg, "success")
                 if keep_open:
+                    Toast.show(self.window, msg, "success")
                     name_entry.delete(0, "end")
                     error_var.set("")
                     name_entry.focus_set()
+                    self.window.after(150, self._refresh_clients)
                 else:
                     dialog.destroy()
-                self.window.after(150, self._refresh_clients)
+                    self._refresh_clients()
+                    Toast.show(self.window, msg, "success")
             else:
                 error_var.set(msg)
 
