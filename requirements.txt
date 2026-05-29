@@ -1,0 +1,13 @@
+# 代账客户收费管理系统 - Python 依赖
+
+# 核心依赖（全部为 Python 标准库，无需额外安装）
+# tkinter  → 自带 GUI
+# sqlite3  → 内置数据库
+# hashlib  → 密码哈希
+# datetime → 日期计算
+
+# Excel 导出（可选，无此库时自动降级为 CSV）
+openpyxl>=3.0.0
+
+# 打包为 exe
+pyinstaller>=6.0.0

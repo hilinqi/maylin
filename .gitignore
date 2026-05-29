@@ -1,0 +1,23 @@
+# 编译产物
+build/
+dist/
+__pycache__/
+*.pyc
+*.pyo
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 打包相关
+*.spec
+build_exe.bat
+
+# IDE
+.vscode/
+.idea/
+
+# 环境
+venv/
+.env
+*.egg-info/
