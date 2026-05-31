@@ -37,6 +37,54 @@ DB_DIR = os.path.join(BASE_DIR, "data")
 DB_PATH = os.path.join(DB_DIR, "clients.db")
 
 
+def _migrate_billing_type_check():
+    """迁移：更新 billing_type CHECK 约束以支持'一人多司'"""
+    conn = get_connection()
+    # 检查表定义中是否已包含'一人多司'
+    table_info = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='clients'"
+    ).fetchone()
+    if table_info and "一人多司" in (table_info["sql"] or ""):
+        conn.close()
+        return  # 约束已更新
+
+    # 重建 clients 表以更新 CHECK 约束
+    conn.execute("PRAGMA foreign_keys = OFF")
+    conn.execute("ALTER TABLE clients RENAME TO clients_old")
+    conn.execute("""
+        CREATE TABLE clients (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            name            TEXT    NOT NULL,
+            billing_type    TEXT    NOT NULL CHECK(billing_type IN ('年收','季收','月收','一人多司')),
+            fee_amount      REAL    NOT NULL DEFAULT 0,
+            last_paid_period TEXT   NOT NULL,
+            next_due_date   TEXT    DEFAULT '',
+            status          TEXT    DEFAULT '有效' CHECK(status IN ('有效','中断','失联')),
+            payment_status  TEXT    DEFAULT '未收' CHECK(payment_status IN ('已收','未收')),
+            charge_period_start TEXT DEFAULT '',
+            charge_period_end   TEXT DEFAULT '',
+            contact_person  TEXT    DEFAULT '',
+            phone           TEXT    DEFAULT '',
+            notes           TEXT    DEFAULT '',
+            is_active       INTEGER DEFAULT 1,
+            created_at      TEXT    DEFAULT (datetime('now','localtime'))
+        )
+    """)
+    conn.execute("""
+        INSERT INTO clients (id, name, billing_type, fee_amount, last_paid_period,
+            next_due_date, status, payment_status, charge_period_start, charge_period_end,
+            contact_person, phone, notes, is_active, created_at)
+        SELECT id, name, billing_type, fee_amount, last_paid_period,
+            '', status, payment_status, charge_period_start, charge_period_end,
+            '', phone, notes, is_active, created_at
+        FROM clients_old
+    """)
+    conn.execute("DROP TABLE clients_old")
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.commit()
+    conn.close()
+
+
 def get_connection():
     """获取数据库连接（自动创建目录和文件）"""
     os.makedirs(DB_DIR, exist_ok=True)
@@ -58,17 +106,19 @@ def init_db():
             created_at  TEXT    DEFAULT (datetime('now','localtime'))
         );
 
-        -- 客户表（年收/季收/月收）
+        -- 客户表（年收/季收/月收/一人多司）
         CREATE TABLE IF NOT EXISTS clients (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             name            TEXT    NOT NULL,
-            billing_type    TEXT    NOT NULL CHECK(billing_type IN ('年收','季收','月收')),
+            billing_type    TEXT    NOT NULL CHECK(billing_type IN ('年收','季收','月收','一人多司')),
             fee_amount      REAL    NOT NULL DEFAULT 0,
             last_paid_period TEXT   NOT NULL,  -- YYYY-MM，已缴费覆盖到的月份
+            next_due_date   TEXT    DEFAULT '',  -- 下次应付期 YYYY-MM（手动设置）
             status          TEXT    DEFAULT '有效' CHECK(status IN ('有效','中断','失联')),
             payment_status  TEXT    DEFAULT '未收' CHECK(payment_status IN ('已收','未收')),
             charge_period_start TEXT DEFAULT '',  -- 收费期间起始 YYYY-MM
             charge_period_end   TEXT DEFAULT '',  -- 收费期间截止 YYYY-MM
+            contact_person  TEXT    DEFAULT '',  -- 联系人
             phone           TEXT    DEFAULT '',
             notes           TEXT    DEFAULT '',
             is_active       INTEGER DEFAULT 1,
@@ -118,6 +168,8 @@ def init_db():
 
     # 数据库迁移：为旧版本添加缺失字段
     _migrate_db()
+    # 迁移 billing_type CHECK 约束（SQLite 不支持直接 ALTER，重建表）
+    _migrate_billing_type_check()
 
 
 def _migrate_db():
@@ -130,6 +182,8 @@ def _migrate_db():
         "ALTER TABLE clients ADD COLUMN payment_status TEXT DEFAULT '未收'",
         "ALTER TABLE clients ADD COLUMN charge_period_start TEXT DEFAULT ''",
         "ALTER TABLE clients ADD COLUMN charge_period_end TEXT DEFAULT ''",
+        "ALTER TABLE clients ADD COLUMN contact_person TEXT DEFAULT ''",
+        "ALTER TABLE clients ADD COLUMN next_due_date TEXT DEFAULT ''",
     ]
     for sql in migrations:
         try:
@@ -266,6 +320,8 @@ def search_clients(keyword: str, billing_filter: str = "全部",
         base_where += " AND billing_type = '季收'"
     elif billing_filter == "月收":
         base_where += " AND billing_type = '月收'"
+    elif billing_filter == "一人多司":
+        base_where += " AND billing_type = '一人多司'"
 
     if status_filter == "有效":
         base_where += " AND status = '有效'"
@@ -282,10 +338,15 @@ def search_clients(keyword: str, billing_filter: str = "全部",
         rows = conn.execute(
             f"SELECT * FROM clients {base_where} ORDER BY name", params
         ).fetchall()
-        rows = [r for r in rows if calc_overdue_months(
-            r["last_paid_period"], r["billing_type"]) > 0]
-        rows.sort(key=lambda r: calc_overdue_months(
-            r["last_paid_period"], r["billing_type"]), reverse=True)
+        rows = [r for r in rows if (
+            r["payment_status"] == "未收" and
+            calc_overdue_months_by_next_due(
+                r["next_due_date"] or calc_next_due(r["last_paid_period"], r["billing_type"])
+            ) > 0
+        )]
+        rows.sort(key=lambda r: calc_overdue_months_by_next_due(
+            r["next_due_date"] or calc_next_due(r["last_paid_period"], r["billing_type"])
+        ), reverse=True)
         total = len(rows)
         rows = rows[offset:offset + limit]
     else:
@@ -298,21 +359,48 @@ def search_clients(keyword: str, billing_filter: str = "全部",
             params + [limit, offset]
         ).fetchall()
 
+    # 先查出所有客户，用于计算"一人多司"
+    all_active = conn.execute(
+        "SELECT id, contact_person FROM clients WHERE is_active = 1 AND contact_person != ''"
+    ).fetchall()
     conn.close()
+
+    contact_count = {}
+    for r in all_active:
+        cp = r["contact_person"].strip()
+        if cp:
+            contact_count[cp] = contact_count.get(cp, 0) + 1
 
     result = []
     for r in rows:
         d = dict(r)
-        mo = calc_overdue_months(d["last_paid_period"], d["billing_type"])
-        level = get_overdue_level(mo)
-        d["overdue_months"] = mo
-        d["next_due"] = calc_next_due(d["last_paid_period"], d["billing_type"])
-        d["overdue_level"] = level["level"]
-        d["overdue_color"] = level["color"]
-        d["overdue_bg"] = level["bg"]
-        d["arrears_amount"] = calc_arrears_amount(
-            d["last_paid_period"], d["billing_type"], d["fee_amount"]
-        )
+        # 使用手动设置的 next_due_date，若为空则用自动计算兜底
+        next_due = d.get("next_due_date", "") or calc_next_due(d["last_paid_period"], d["billing_type"])
+        d["next_due"] = next_due
+
+        # 逾期判断：仅当 payment_status 为"未收"时才计算
+        if d.get("payment_status", "未收") == "已收":
+            d["overdue_months"] = 0
+            d["overdue_level"] = "正常"
+            d["overdue_color"] = "#2E7D32"
+            d["overdue_bg"] = "#E8F5E9"
+            d["arrears_amount"] = 0.0
+        else:
+            mo = calc_overdue_months_by_next_due(next_due)
+            level = get_overdue_level(mo)
+            d["overdue_months"] = mo
+            # 逾期状态直接用月数表达
+            if mo > 0:
+                d["overdue_level"] = f"逾期{mo}个月"
+            else:
+                d["overdue_level"] = "正常"
+            d["overdue_color"] = level["color"]
+            d["overdue_bg"] = level["bg"]
+            # 欠费金额 = 应收金额（未收即欠费）
+            d["arrears_amount"] = d["fee_amount"]
+        # 一人多司：同一联系人出现≥2次
+        cp = (d.get("contact_person", "") or "").strip()
+        d["is_multi_company"] = contact_count.get(cp, 0) >= 2 if cp else False
         # 收费期间显示文本
         d["charge_period_display"] = format_charge_period(
             d.get("charge_period_start", ""), d.get("charge_period_end", "")
@@ -366,26 +454,30 @@ def calc_next_due(last_paid_period: str, billing_type: str) -> str:
     return f"{y}-{m:02d}"
 
 
-def calc_arrears_amount(last_paid_period: str, billing_type: str, fee_amount: float) -> float:
-    """计算欠费金额
-
-    逻辑：逾期月数 / 收费周期月数，向上取整，再 × 单次费用
-      季收（3个月）：逾期4个月 → 2个季度 → 欠 2×fee
-      年收（12个月）：逾期15个月 → 2年 → 欠 2×fee
-    """
-    import math
-    overdue = calc_overdue_months(last_paid_period, billing_type)
-    if overdue <= 0:
-        return 0.0
-    months_per_period = get_billing_months(billing_type)
-    periods = math.ceil(overdue / months_per_period)
-    return round(periods * fee_amount, 2)
-
-
 def get_total_arrears() -> float:
-    """获取所有客户欠费总金额"""
-    clients = get_clients("全部")
-    return round(sum(c.get("arrears_amount", 0) for c in clients), 2)
+    """获取所有未收客户的应收总额"""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT SUM(fee_amount) as total FROM clients WHERE is_active = 1 AND payment_status != '已收'"
+    ).fetchone()
+    conn.close()
+    return round(row["total"] or 0, 2)
+
+
+def calc_overdue_months_by_next_due(next_due: str) -> int:
+    """根据下次应付期计算逾期月数
+    当前月份 vs 下次应付月份
+    """
+    if not next_due or next_due == "-":
+        return 0
+    try:
+        due_y, due_m = map(int, next_due.split("-"))
+        now = datetime.now()
+        current_months = now.year * 12 + now.month
+        due_months = due_y * 12 + due_m
+        return current_months - due_months
+    except (ValueError, AttributeError):
+        return 0
 
 
 def calc_overdue_months(last_paid_period: str, billing_type: str) -> int:
@@ -395,11 +487,7 @@ def calc_overdue_months(last_paid_period: str, billing_type: str) -> int:
         若当前月 > 下次应付月 → 正数 = 逾期月数
     """
     next_due = calc_next_due(last_paid_period, billing_type)
-    due_y, due_m = map(int, next_due.split("-"))
-    now = datetime.now()
-    current_months = now.year * 12 + now.month
-    due_months = due_y * 12 + due_m
-    return current_months - due_months
+    return calc_overdue_months_by_next_due(next_due)
 
 
 def get_overdue_level(months_overdue: int) -> Dict:
@@ -427,7 +515,8 @@ def get_overdue_level(months_overdue: int) -> Dict:
 def add_client(name: str, billing_type: str, fee_amount: float,
                last_paid_period: str, phone: str = "", notes: str = "",
                status: str = "有效", payment_status: str = "未收",
-               charge_period_start: str = "", charge_period_end: str = "") -> Tuple[bool, str]:
+               charge_period_start: str = "", charge_period_end: str = "",
+               contact_person: str = "", next_due_date: str = "") -> Tuple[bool, str]:
     """新增客户"""
     if not name.strip():
         return False, "客户名称不能为空"
@@ -435,11 +524,13 @@ def add_client(name: str, billing_type: str, fee_amount: float,
         conn = get_connection()
         conn.execute(
             """INSERT INTO clients (name, billing_type, fee_amount, last_paid_period,
-               phone, notes, status, payment_status, charge_period_start, charge_period_end)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               phone, notes, status, payment_status, charge_period_start, charge_period_end,
+               contact_person, next_due_date)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (name.strip(), billing_type, fee_amount, last_paid_period,
              phone.strip(), notes.strip(), status, payment_status,
-             charge_period_start, charge_period_end)
+             charge_period_start, charge_period_end,
+             contact_person.strip(), next_due_date)
         )
         conn.commit()
         conn.close()
@@ -456,7 +547,8 @@ def update_client(client_id: int, **kwargs) -> Tuple[bool, str]:
     """更新客户信息（支持部分字段更新）"""
     allowed = {"name", "billing_type", "fee_amount", "last_paid_period",
                "phone", "notes", "is_active", "status", "payment_status",
-               "charge_period_start", "charge_period_end"}
+               "charge_period_start", "charge_period_end",
+               "contact_person", "next_due_date"}
     updates = {k: v for k, v in kwargs.items() if k in allowed}
     if not updates:
         return False, "无有效更新字段"
@@ -552,7 +644,7 @@ def batch_record_payment(client_ids: List[int], paid_date: str = "",
 def get_overdue_summary() -> Dict:
     """获取逾期客户汇总信息"""
     clients = get_clients("逾期")
-    total_arrears = sum(c.get("arrears_amount", 0) for c in clients)
+    total_arrears = sum(c.get("fee_amount", 0) for c in clients)
     return {
         "count": len(clients),
         "total_arrears": round(total_arrears, 2),
@@ -588,20 +680,22 @@ def export_stats_to_excel(year: int, month: int, filepath: str = None) -> str:
     ws["A3"] = "本月总收入"; ws["B3"] = stats["total_collected"]
     ws["A4"] = "年收客户贡献"; ws["B4"] = stats["annual_contribution"]
     ws["A5"] = "季收客户贡献"; ws["B5"] = stats["quarterly_contribution"]
-    ws["A6"] = "按次业务贡献"; ws["B6"] = stats["service_contribution"]
-    ws["A7"] = "应收未收"; ws["B7"] = stats["unpaid"]
-    ws["A8"] = "收款率"; ws["B8"] = f"{stats['collection_rate']}%"
-    ws["A9"] = "应收欠款总额"; ws["B9"] = stats.get("total_arrears", 0)
+    ws["A6"] = "月收客户贡献"; ws["B6"] = stats.get("monthly_contribution", 0)
+    ws["A7"] = "按次业务贡献"; ws["B7"] = stats["service_contribution"]
+    ws["A8"] = "当月应收未收"; ws["B8"] = stats["unpaid"]
+    ws["A9"] = "按次业务未收"; ws["B9"] = stats.get("service_due", 0)
+    ws["A10"] = "收款率"; ws["B10"] = f"{stats['collection_rate']}%"
+    ws["A11"] = "应收欠款总额"; ws["B11"] = stats.get("total_arrears", 0)
 
     # 明细表头
-    ws["A11"] = "客户/业务"; ws["B11"] = "类型"
-    ws["C11"] = "金额(元)"; ws["D11"] = "收费期"
-    ws["E11"] = "收款日期"
-    for col in ["A11", "B11", "C11", "D11", "E11"]:
+    ws["A13"] = "客户/业务"; ws["B13"] = "类型"
+    ws["C13"] = "金额(元)"; ws["D13"] = "收费期"
+    ws["E13"] = "收款日期"
+    for col in ["A13", "B13", "C13", "D13", "E13"]:
         ws[col].font = openpyxl.styles.Font(bold=True)
 
     # 明细数据
-    for i, d in enumerate(stats["details"], start=12):
+    for i, d in enumerate(stats["details"], start=14):
         ws[f"A{i}"] = d["client_name"]
         ws[f"B{i}"] = d["type"]
         ws[f"C{i}"] = d["amount"]
@@ -635,8 +729,10 @@ def _export_stats_csv(year: int, month: int, filepath: str = None) -> str:
         writer.writerow(["本月总收入", stats["total_collected"]])
         writer.writerow(["年收客户贡献", stats["annual_contribution"]])
         writer.writerow(["季收客户贡献", stats["quarterly_contribution"]])
+        writer.writerow(["月收客户贡献", stats.get("monthly_contribution", 0)])
         writer.writerow(["按次业务贡献", stats["service_contribution"]])
-        writer.writerow(["应收未收", stats["unpaid"]])
+        writer.writerow(["当月应收未收", stats["unpaid"]])
+        writer.writerow(["按次业务未收", stats.get("service_due", 0)])
         writer.writerow(["收款率", f"{stats['collection_rate']}%"])
         writer.writerow([])
         writer.writerow(["客户/业务", "类型", "金额(元)", "收费期", "收款日期"])
@@ -821,9 +917,11 @@ def get_monthly_stats(year: int, month: int) -> Dict:
             "total_collected": 本月已收总额,
             "annual_contribution": 年收客户贡献,
             "quarterly_contribution": 季收客户贡献,
-            "service_contribution": 按次业务贡献,
-            "total_due": 当月应收总额（到期客户+按次）,
-            "unpaid": 应收未收,
+            "monthly_contribution": 月收客户贡献,
+            "service_contribution": 按次业务已收,
+            "total_due": 当月应收总额（到期客户）,
+            "unpaid": 当月应收未收,
+            "service_due": 按次业务未收（全部）,
             "collection_rate": 收款率%,
             "details": [收入明细列表],
         }
@@ -831,10 +929,10 @@ def get_monthly_stats(year: int, month: int) -> Dict:
     month_str = f"{year}-{month:02d}"
     conn = get_connection()
 
-    # 本月已收：从 payments 表统计
+    # 本月已收：从 payments 表统计（LEFT JOIN 保留已删除客户的历史收款记录）
     paid_rows = conn.execute(
         """SELECT p.*, c.name, c.billing_type
-           FROM payments p JOIN clients c ON p.client_id = c.id
+           FROM payments p LEFT JOIN clients c ON p.client_id = c.id
            WHERE strftime('%Y-%m', p.paid_date) = ?""",
         (month_str,)
     ).fetchall()
@@ -842,46 +940,57 @@ def get_monthly_stats(year: int, month: int) -> Dict:
     total_collected = sum(r["amount"] for r in paid_rows)
     annual_contribution = sum(r["amount"] for r in paid_rows if r["billing_type"] == "年收")
     quarterly_contribution = sum(r["amount"] for r in paid_rows if r["billing_type"] == "季收")
+    monthly_contribution = sum(r["amount"] for r in paid_rows if r["billing_type"] == "月收")
 
     # 按次业务本月已收
     svc_rows = conn.execute(
-        """SELECT * FROM services
-           WHERE status='已收' AND strftime('%Y-%m', completed_date) = ?""",
+        """SELECT s.*, COALESCE(c.name, s.temp_customer_name) as client_name
+           FROM services s LEFT JOIN clients c ON s.client_id = c.id
+           WHERE s.status='已收' AND strftime('%Y-%m', s.completed_date) = ?""",
         (month_str,)
     ).fetchall()
     service_contribution = sum(r["actual_fee"] for r in svc_rows)
 
     total_collected += service_contribution
 
-    # 当月应收：所有客户下次应付期在本月的
+    # 按次业务未收总额（全部，不限月份）
+    svc_due_row = conn.execute(
+        "SELECT SUM(fee_standard) as total FROM services WHERE status='未收'"
+    ).fetchone()
+    service_due = round(svc_due_row["total"] or 0, 2)
+
+    # 当月应收：活跃客户中，下次应付期在本月的
+    # 使用手动设置的 next_due_date，若为空则用自动计算兜底
     all_clients = conn.execute(
         "SELECT * FROM clients WHERE is_active = 1"
     ).fetchall()
 
     total_due = 0
     for c in all_clients:
-        next_due = calc_next_due(c["last_paid_period"], c["billing_type"])
+        next_due = c["next_due_date"] or calc_next_due(c["last_paid_period"], c["billing_type"])
         if next_due == month_str:
             total_due += c["fee_amount"]
 
-    unpaid = max(0, total_due - (total_collected - service_contribution))
+    # 当月应收未收 = 当月应收 - 本月客户已收（不含按次）
+    client_collected = total_collected - service_contribution
+    unpaid = max(0, round(total_due - client_collected, 2))
 
-    # 收款率
-    collection_rate = round(total_collected / total_due * 100, 1) if total_due > 0 else 100.0
+    # 收款率：本月客户已收 / 当月应收
+    collection_rate = round(client_collected / total_due * 100, 1) if total_due > 0 else 100.0
 
     # 收入明细
     details = []
     for r in paid_rows:
         details.append({
-            "client_name": r["name"],
-            "type": r["billing_type"],
+            "client_name": r["name"] or "(已删除客户)",
+            "type": r["billing_type"] or "未知",
             "amount": r["amount"],
             "period": f"{r['period_from']}~{r['period_to']}",
             "paid_date": r["paid_date"],
         })
     for s in svc_rows:
         details.append({
-            "client_name": f"(按次){s['service_type']}",
+            "client_name": s["client_name"] or f"(按次){s['service_type']}",
             "type": "按次",
             "amount": s["actual_fee"],
             "period": "-",
@@ -895,9 +1004,11 @@ def get_monthly_stats(year: int, month: int) -> Dict:
         "total_collected": total_collected,
         "annual_contribution": annual_contribution,
         "quarterly_contribution": quarterly_contribution,
+        "monthly_contribution": monthly_contribution,
         "service_contribution": service_contribution,
         "total_due": round(total_due, 2),
-        "unpaid": round(unpaid, 2),
+        "unpaid": unpaid,
+        "service_due": service_due,
         "total_arrears": get_total_arrears(),
         "collection_rate": collection_rate,
         "details": details,
@@ -935,11 +1046,13 @@ if __name__ == "__main__":
 
     # 测试添加客户
     add_client("张三科技", "季收", 1500, "2025-01", "13800001111", "一般纳税人",
-               status="有效", charge_period_start="2025-01", charge_period_end="2025-03")
+               status="有效", charge_period_start="2025-01", charge_period_end="2025-03",
+               contact_person="张经理", next_due_date="2025-04")
     add_client("李四商贸", "年收", 6000, "2024-06", "13900002222", "",
-               status="有效", charge_period_start="2024-06", charge_period_end="2025-05")
+               status="有效", charge_period_start="2024-06", charge_period_end="2025-05",
+               contact_person="张经理", next_due_date="2025-06")
     add_client("王五餐饮", "季收", 2000, "2024-10", phone="13700003333",
-               status="中断")
+               status="中断", contact_person="王老板", next_due_date="2025-01")
 
     # 测试查询
     clients = get_clients("全部")
@@ -948,7 +1061,8 @@ if __name__ == "__main__":
         print(f"  {c['name']} | {c['billing_type']} | ¥{c['fee_amount']} | "
               f"最近已收:{c['last_paid_period']} | 下次应付:{c['next_due']} | "
               f"逾期:{c['overdue_months']}月 | {c['overdue_level']} | "
-              f"收费期间:{c['charge_period_display']} | 状态:{c.get('status','有效')}")
+              f"收费期间:{c['charge_period_display']} | 联系人:{c.get('contact_person','')} | "
+              f"一人多司:{c.get('is_multi_company',False)} | 状态:{c.get('status','有效')}")
 
     # 测试收款
     if clients:

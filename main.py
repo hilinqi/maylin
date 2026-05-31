@@ -20,7 +20,7 @@ from database import (
     init_db, admin_exists, register_admin, login_admin,
     add_client, update_client, delete_client, get_clients,
     record_payment, calc_next_due, detect_billing_type_from_period,
-    calc_overdue_months, get_overdue_level, get_billing_months,
+    calc_overdue_months, get_overdue_level,
     add_service, mark_service_done, delete_service, get_services,
     get_monthly_stats, get_year_trend, get_total_arrears,
     search_clients, get_clients_paginated,
@@ -45,7 +45,7 @@ COLOR_WARNING = "#D4A017"
 COLOR_DANGER = "#D93025"
 COLOR_BG = "#F5F5F5"
 
-PAGE_SIZE = 20  # 每页显示条数
+PAGE_SIZE = 50  # 每页显示条数
 
 
 # ============================================================
@@ -292,6 +292,7 @@ class MainWindow:
             ("📅 年收客户", "年收"),
             ("📆 季收客户", "季收"),
             ("📌 月收客户", "月收"),
+            ("👥 一人多司", "一人多司"),
         ]
         for text, val in cycle_filters:
             tk.Radiobutton(filter_frame, text=text, variable=self.filter_var,
@@ -369,14 +370,14 @@ class MainWindow:
         tree_frame = tk.Frame(self.tab_clients, bg=COLOR_BG)
         tree_frame.pack(fill="both", expand=True, padx=10, pady=3)
 
-        columns = ("select", "id", "name", "status", "billing_type", "fee_amount",
+        columns = ("select", "id", "name", "contact_person", "status", "billing_type", "fee_amount",
                    "payment_status", "charge_period", "next_due", "arrears", "overdue_status", "notes")
         self.client_tree = ttk.Treeview(tree_frame, columns=columns, show="headings",
                                          selectmode="browse", height=12)
 
         headers = [
-            ("☐", 35), ("ID", 35), ("客户名称", 110), ("状态", 50),
-            ("收费周期", 55), ("应收金额(元)", 85), ("收款状态", 65),
+            ("☐", 35), ("ID", 35), ("客户名称", 130), ("联系人", 70), ("状态", 50),
+            ("收费周期", 80), ("应收金额(元)", 85), ("收款状态", 65),
             ("收费期间", 195),
             ("下次应付期", 80), ("欠费金额", 80), ("逾期状态", 95), ("备注", 400),
         ]
@@ -386,6 +387,10 @@ class MainWindow:
             self.client_tree.heading(col, text=text)
             anchor = "center" if col in centers else "w"
             self.client_tree.column(col, width=width, anchor=anchor, minwidth=width)
+
+        # 客户名称列和备注列支持自动扩展
+        self.client_tree.column("name", width=130, anchor="w", minwidth=60)
+        self.client_tree.column("notes", width=400, anchor="w", minwidth=100)
 
         vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.client_tree.yview)
         self.client_tree.configure(yscrollcommand=vsb.set)
@@ -580,13 +585,21 @@ class MainWindow:
         # 填充表格
         for c in clients:
             checked = "☑" if c["id"] in self.selected_ids else "☐"
-            color_map = {
-                "正常": "green", "逾期1季度": "yellow",
-                "逾期半年": "orange", "逾期1年": "red", "久悬户": "darkred",
-            }
-            tag = color_map.get(c["overdue_level"], "green")
 
-            arrears = c.get("arrears_amount", 0)
+            # 根据逾期月数决定行颜色
+            mo = c.get("overdue_months", 0)
+            if mo >= 24:
+                tag = "darkred"
+            elif mo >= 12:
+                tag = "red"
+            elif mo >= 6:
+                tag = "orange"
+            elif mo >= 3:
+                tag = "yellow"
+            elif mo > 0:
+                tag = "yellow"
+            else:
+                tag = "green"
 
             # 收费期间显示
             charge_period_display = c.get("charge_period_display", "-")
@@ -594,16 +607,20 @@ class MainWindow:
             # 收款状态
             payment_status = c.get("payment_status", "未收")
 
-            # 根据收款状态决定欠费金额和逾期状况的显示
+            # 一人多司标识
+            billing_display = c["billing_type"]
+            if c.get("is_multi_company", False):
+                billing_display = c["billing_type"] + " 👥一人多司"
+
+            # 欠费金额：未收=应收金额，已收=正常
             if payment_status == "已收":
                 arrears_text = "正常"
                 status_text = "正常"
             else:
-                arrears_text = "正常" if arrears == 0 else f"¥{arrears:,.0f}"
-                if c["overdue_months"] > 0:
-                    status_text = f"逾期{c['overdue_months']}个月"
-                else:
-                    status_text = "正常"
+                fee = c.get("fee_amount", 0)
+                arrears_text = f"¥{fee:,.0f}"
+                # 逾期状态直接用 overdue_level
+                status_text = c.get("overdue_level", "正常")
 
             # 行颜色：中断=蓝、失联=红、已收=绿、未收=逾期等级色
             client_status = c.get("status", "有效")
@@ -617,8 +634,9 @@ class MainWindow:
                 final_tag = tag
 
             self.client_tree.insert("", "end", values=(
-                checked, c["id"], c["name"], c.get("status", "有效"),
-                c["billing_type"], f"¥{c['fee_amount']:,.0f}",
+                checked, c["id"], c["name"], c.get("contact_person", ""),
+                c.get("status", "有效"),
+                billing_display, f"¥{c['fee_amount']:,.0f}",
                 payment_status,
                 charge_period_display, c["next_due"],
                 arrears_text, status_text, c["notes"],
@@ -626,7 +644,8 @@ class MainWindow:
 
         self._show_loading(False)
 
-        # 自动调整备注列宽度（根据最长备注内容）
+        # 自动调整客户名称和备注列宽度
+        self._auto_width_name_column(clients)
         self._auto_width_notes_column(clients)
 
         # 更新全选状态
@@ -659,6 +678,25 @@ class MainWindow:
             self.loading_label.pack(side="right", padx=10)
         else:
             self.loading_label.pack_forget()
+
+    def _auto_width_name_column(self, clients):
+        """根据当前页所有客户名称的长度自动调整名称列宽度"""
+        if not clients:
+            self.client_tree.column("name", width=100)
+            return
+        max_len = 0
+        for c in clients:
+            name = c.get("name", "") or ""
+            # 估算像素宽度：中文字符约14px，ASCII约8px
+            px = 0
+            for ch in name:
+                if '\u4e00' <= ch <= '\u9fff' or '\u3000' <= ch <= '\u303f' or '\uff00' <= ch <= '\uffef':
+                    px += 14
+                else:
+                    px += 8
+            max_len = max(max_len, px)
+        width = max(80, min(max_len + 30, 400))
+        self.client_tree.column("name", width=width)
 
     def _auto_width_notes_column(self, clients):
         """根据当前页所有备注内容的长度自动调整备注列宽度"""
@@ -758,7 +796,7 @@ class MainWindow:
         """新增客户弹窗（收费期间 + 状态 + 实时校验）"""
         dialog = tk.Toplevel(self.window)
         dialog.title("新增客户")
-        dialog.geometry("450x510")
+        dialog.geometry("450x600")
         dialog.resizable(False, False)
         dialog.configure(bg="#FFFFFF")
         dialog.transient(self.window)
@@ -781,6 +819,13 @@ class MainWindow:
         name_entry.grid(row=row, column=1, columnspan=2, sticky="w", padx=5)
         name_entry.bind("<KeyRelease>", lambda e: self._validate_name(
             name_entry.get().strip(), error_var))
+
+        # —— 联系人 ——
+        row += 1
+        tk.Label(dialog, text="联系人", font=FONT_NORMAL, bg="#FFFFFF").grid(
+            row=row, column=0, sticky="e", padx=(20, 5), pady=6)
+        contact_entry = tk.Entry(dialog, font=FONT_NORMAL, width=22)
+        contact_entry.grid(row=row, column=1, columnspan=2, sticky="w", padx=5)
 
         # —— 状态 ——
         row += 1
@@ -844,6 +889,27 @@ class MainWindow:
                 pass
         start_var.trace_add("write", on_period_change)
         end_var.trace_add("write", on_period_change)
+
+        # —— 下次应付期 ——
+        row += 1
+        tk.Label(dialog, text="下次应付期", font=FONT_NORMAL, bg="#FFFFFF").grid(
+            row=row, column=0, sticky="e", padx=(20, 5), pady=6)
+        next_due_frame = tk.Frame(dialog, bg="#FFFFFF")
+        next_due_frame.grid(row=row, column=1, columnspan=2, sticky="w", padx=5)
+
+        # 默认下次应付期（季收：当前月+3）
+        nd_month = now.month + 3
+        nd_year = now.year
+        while nd_month > 12:
+            nd_month -= 12
+            nd_year += 1
+        next_due_var = tk.StringVar(value=f"{nd_year}-{nd_month:02d}")
+        next_due_cb = ttk.Combobox(next_due_frame, textvariable=next_due_var,
+                                     values=year_months,
+                                     font=FONT_NORMAL, state="readonly", width=8)
+        next_due_cb.pack(side="left")
+        tk.Label(next_due_frame, text="（手动设置，非自动计算）",
+                 font=FONT_SMALL, bg="#FFFFFF", fg="#999").pack(side="left", padx=3)
 
         # —— 应收金额 ——
         row += 1
@@ -929,6 +995,8 @@ class MainWindow:
                 payment_status=pay_status_var.get(),
                 charge_period_start=period_start,
                 charge_period_end=period_end,
+                contact_person=contact_entry.get().strip(),
+                next_due_date=next_due_var.get(),
             )
             if ok:
                 if keep_open:
@@ -981,7 +1049,7 @@ class MainWindow:
 
         dialog = tk.Toplevel(self.window)
         dialog.title(f"编辑客户 — {values[2]}")
-        dialog.geometry("450x480")
+        dialog.geometry("450x580")
         dialog.resizable(False, False)
         dialog.configure(bg="#FFFFFF")
         dialog.transient(self.window)
@@ -1002,11 +1070,19 @@ class MainWindow:
         name_entry.insert(0, values[2])
         name_entry.grid(row=row, column=1, columnspan=2, sticky="w", padx=5)
 
+        # 联系人
+        row += 1
+        tk.Label(dialog, text="联系人", font=FONT_NORMAL, bg="#FFFFFF").grid(
+            row=row, column=0, sticky="e", padx=(20, 5), pady=6)
+        contact_entry = tk.Entry(dialog, font=FONT_NORMAL, width=22)
+        contact_entry.insert(0, values[3])
+        contact_entry.grid(row=row, column=1, columnspan=2, sticky="w", padx=5)
+
         # 状态
         row += 1
         tk.Label(dialog, text="状态", font=FONT_NORMAL, bg="#FFFFFF").grid(
             row=row, column=0, sticky="e", padx=(20, 5), pady=6)
-        status_var = tk.StringVar(value=values[3])
+        status_var = tk.StringVar(value=values[4])
         status_cb = ttk.Combobox(dialog, textvariable=status_var,
                                   values=["有效", "中断", "失联"],
                                   font=FONT_NORMAL, state="readonly", width=8)
@@ -1016,9 +1092,11 @@ class MainWindow:
         row += 1
         tk.Label(dialog, text="收费周期", font=FONT_NORMAL, bg="#FFFFFF").grid(
             row=row, column=0, sticky="e", padx=(20, 5), pady=6)
-        billing_var = tk.StringVar(value=values[4])
+        # 去除可能的一人多司后缀
+        raw_billing = values[5].replace(" 👥一人多司", "")
+        billing_var = tk.StringVar(value=raw_billing)
         billing_cb = ttk.Combobox(dialog, textvariable=billing_var,
-                                   values=["季收", "年收", "月收"],
+                                   values=["季收", "年收", "月收", "一人多司"],
                                    font=FONT_NORMAL, state="readonly", width=8)
         billing_cb.grid(row=row, column=1, sticky="w", padx=5)
 
@@ -1028,7 +1106,7 @@ class MainWindow:
             row=row, column=0, sticky="e", padx=(20, 5), pady=6)
 
         # 尝试从 charge_period_display 中解析
-        period_display = values[7]  # 收费期间列
+        period_display = values[8]  # 收费期间列
 
         period_frame = tk.Frame(dialog, bg="#FFFFFF")
         period_frame.grid(row=row, column=1, columnspan=2, sticky="w", padx=5)
@@ -1066,19 +1144,31 @@ class MainWindow:
                                       font=FONT_NORMAL, state="readonly", width=8)
         period_end_cb.pack(side="left")
 
+        # —— 下次应付期 ——
+        row += 1
+        tk.Label(dialog, text="下次应付期", font=FONT_NORMAL, bg="#FFFFFF").grid(
+            row=row, column=0, sticky="e", padx=(20, 5), pady=6)
+        next_due_frame = tk.Frame(dialog, bg="#FFFFFF")
+        next_due_frame.grid(row=row, column=1, columnspan=2, sticky="w", padx=5)
+        edit_next_due_var = tk.StringVar(value=values[9] if values[9] != "-" else "")
+        edit_next_due_cb = ttk.Combobox(next_due_frame, textvariable=edit_next_due_var,
+                                          values=year_months,
+                                          font=FONT_NORMAL, state="readonly", width=8)
+        edit_next_due_cb.pack(side="left")
+
         # 应收金额
         row += 1
         tk.Label(dialog, text="应收金额（元）", font=FONT_NORMAL, bg="#FFFFFF").grid(
             row=row, column=0, sticky="e", padx=(20, 5), pady=6)
         fee_entry = tk.Entry(dialog, font=FONT_NORMAL, width=10)
-        fee_entry.insert(0, values[5].replace("¥", "").replace(",", ""))
+        fee_entry.insert(0, values[6].replace("¥", "").replace(",", ""))
         fee_entry.grid(row=row, column=1, sticky="w", padx=5)
 
         # —— 收款状态 ——
         row += 1
         tk.Label(dialog, text="收款状态", font=FONT_NORMAL, bg="#FFFFFF").grid(
             row=row, column=0, sticky="e", padx=(20, 5), pady=6)
-        edit_pay_status_var = tk.StringVar(value=values[6])
+        edit_pay_status_var = tk.StringVar(value=values[7])
         edit_pay_status_cb = ttk.Combobox(dialog, textvariable=edit_pay_status_var,
                                             values=["未收", "已收"],
                                             font=FONT_NORMAL, state="readonly", width=8)
@@ -1089,7 +1179,7 @@ class MainWindow:
         tk.Label(dialog, text="备注", font=FONT_NORMAL, bg="#FFFFFF").grid(
             row=row, column=0, sticky="e", padx=(20, 5), pady=6)
         notes_entry = tk.Entry(dialog, font=FONT_NORMAL, width=22)
-        notes_entry.insert(0, values[11])
+        notes_entry.insert(0, values[12])
         notes_entry.grid(row=row, column=1, columnspan=2, sticky="w", padx=5)
 
         row += 1
@@ -1130,6 +1220,8 @@ class MainWindow:
                 notes=notes_entry.get().strip(),
                 charge_period_start=period_start,
                 charge_period_end=period_end,
+                contact_person=contact_entry.get().strip(),
+                next_due_date=edit_next_due_var.get(),
             )
             if ok:
                 dialog.destroy()
@@ -1158,7 +1250,7 @@ class MainWindow:
         values = self.client_tree.item(sel[0], "values")
         client_id = int(values[1])
         client_name = values[2]
-        status = values[10]  # 逾期状态
+        status = values[11]  # 逾期状态
 
         warning = ""
         if "逾期" in status:
@@ -1182,10 +1274,10 @@ class MainWindow:
         values = self.client_tree.item(sel[0], "values")
         client_id = int(values[1])
         client_name = values[2]
-        billing_type = values[4]
-        fee_str = values[5].replace("¥", "").replace(",", "")
-        last_paid = values[7]  # 收费期间
-        next_due = values[8]
+        billing_type = values[5].replace(" 👥一人多司", "")  # 原始收费周期
+        fee_str = values[6].replace("¥", "").replace(",", "")
+        last_paid = values[8]  # 收费期间
+        next_due = values[9]
 
         # 获取实际 last_paid_period
         clients_list = get_clients("全部")
@@ -1201,7 +1293,8 @@ class MainWindow:
             fee_amount = 0
 
         months_overdue = calc_overdue_months(last_paid_period, billing_type)
-        level = get_overdue_level(months_overdue)
+        level_info = get_overdue_level(months_overdue)
+        overdue_text = f"逾期{months_overdue}个月" if months_overdue > 0 else "正常"
 
         dialog = tk.Toplevel(self.window)
         dialog.title(f"记录收款 — {client_name}")
@@ -1217,9 +1310,7 @@ class MainWindow:
 
         info_text = (f"收费周期: {billing_type}   标准金额: ¥{fee_amount:,.0f}\n"
                      f"最近已收期: {last_paid_period}   下次应付期: {next_due}\n"
-                     f"当前状态: {level['level']}（已逾期 {months_overdue} 个月）"
-                     if months_overdue > 0 else
-                     f"当前状态: {level['level']}")
+                     f"当前状态: {overdue_text}")
         tk.Label(info_frame, text=info_text, font=FONT_NORMAL, bg="#FFFFFF",
                  justify="left").pack(padx=10, pady=10)
 
@@ -1757,10 +1848,12 @@ class MainWindow:
             ("💰 本月总收入", f"¥{stats['total_collected']:,.0f}", COLOR_PRIMARY),
             ("📅 年收客户贡献", f"¥{stats['annual_contribution']:,.0f}", "#1565C0"),
             ("📆 季收客户贡献", f"¥{stats['quarterly_contribution']:,.0f}", "#00838F"),
+            ("📌 月收客户贡献", f"¥{stats.get('monthly_contribution', 0):,.0f}", "#E65100"),
             ("📋 按次业务贡献", f"¥{stats['service_contribution']:,.0f}", "#6A1B9A"),
-            ("✅ 已收金额", f"¥{stats['total_collected']:,.0f}", COLOR_SUCCESS),
-            ("⏳ 应收未收", f"¥{stats['unpaid']:,.0f}",
+            ("⏳ 当月应收未收", f"¥{stats['unpaid']:,.0f}",
              COLOR_DANGER if stats['unpaid'] > 0 else COLOR_SUCCESS),
+            ("📋 按次业务未收", f"¥{stats.get('service_due', 0):,.0f}",
+             COLOR_DANGER if stats.get('service_due', 0) > 0 else COLOR_SUCCESS),
             ("📛 欠款总额", f"¥{stats.get('total_arrears', 0):,.0f}",
              COLOR_DANGER if stats.get('total_arrears', 0) > 0 else COLOR_SUCCESS),
             ("📈 收款率", f"{stats['collection_rate']}%",
